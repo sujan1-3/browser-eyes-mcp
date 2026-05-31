@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""
+browser-eyes CLI
+
+Usage:
+    browser-eyes start                  launch daemon in background
+    browser-eyes stop                   kill daemon
+    browser-eyes restart                stop + start
+    browser-eyes status                 is it running, what's it seeing
+    browser-eyes info                   full diagnostic dump
+    browser-eyes logs [N]               tail recent events (default 30)
+    browser-eyes tail                   live-stream new events
+    browser-eyes exec OP [k=v ...]      call a daemon op directly
+    browser-eyes ops                    list available daemon ops
+    browser-eyes mcp                    run MCP server (Claude Code calls this)
+    browser-eyes wipe                   delete all state (cookies, frames, db)
+"""
+
+import asyncio
+import json
+import os
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE_DIR = Path.home() / ".local" / "state" / "browser-eyes"
+PID_FILE = STATE_DIR / "daemon.pid"
+DB_PATH = STATE_DIR / "events.db"
+LOG_FILE = STATE_DIR / "daemon.log"
+SOCK_PATH = STATE_DIR / "daemon.sock"
+FRAME_DIR = STATE_DIR / "frames"
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+# When installed, daemon/mcp live alongside this script. When running
+# from the source tree, they live in ../src/.
+SRC_DIR = (SCRIPT_DIR / "src" if (SCRIPT_DIR / "src").exists()
+           else SCRIPT_DIR / ".." / "src" if (SCRIPT_DIR / ".." / "src").exists()
+           else SCRIPT_DIR)
+DAEMON = SRC_DIR / "daemon.py"
+MCP = SRC_DIR / "mcp_server.py"
+
+
+def is_running():
+    if not PID_FILE.exists():
+        return False
+    try:
+        pid = int(PID_FILE.read_text())
+        os.kill(pid, 0)
+        return pid
+    except (ValueError, ProcessLookupError, PermissionError):
+        return False
+
+
+async def call_daemon(op, **kwargs):
+    if not SOCK_PATH.exists():
+        return {"ok": False, "error": "daemon not running"}
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(SOCK_PATH))
+    except Exception as e:
+        return {"ok": False, "error": f"unreachable: {e}"}
+    writer.write((json.dumps({"op": op, **kwargs}) + "\n").encode())
+    await writer.drain()
+    chunks = []
+    while True:
+        chunk = await reader.read(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        if b"\n" in chunk:
+            break
+    data = b"".join(chunks)
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
+    if not data:
+        return {"ok": False, "error": "empty response"}
+    return json.loads(data.decode().split("\n", 1)[0])
+
+
+def cmd_start():
+    if is_running():
+        print(f"already running (pid {is_running()})")
+        return
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    logf = open(LOG_FILE, "a")
+    proc = subprocess.Popen(
+        [sys.executable, str(DAEMON)],
+        stdout=logf, stderr=logf,
+        start_new_session=True,
+    )
+    time.sleep(2.0)
+    if proc.poll() is not None:
+        print(f"daemon died immediately. Check {LOG_FILE}")
+        print()
+        if LOG_FILE.exists():
+            print(LOG_FILE.read_text().splitlines()[-10:])
+        sys.exit(1)
+    print(f"started (pid {proc.pid})")
+    print(f"  logs:    {LOG_FILE}")
+    print(f"  socket:  {SOCK_PATH}")
+    print(f"  state:   {STATE_DIR}")
+
+
+def cmd_stop():
+    pid = is_running()
+    if not pid:
+        print("not running")
+        return
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(30):
+        time.sleep(0.2)
+        if not is_running():
+            print("stopped")
+            return
+    os.kill(pid, signal.SIGKILL)
+    print("force-killed")
+
+
+def cmd_restart():
+    cmd_stop()
+    time.sleep(1)
+    cmd_start()
+
+
+def cmd_status():
+    pid = is_running()
+    if pid:
+        print(f"✓ running (pid {pid})")
+    else:
+        print("✗ not running")
+        return
+    if DB_PATH.exists():
+        con = sqlite3.connect(DB_PATH)
+        n = con.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        latest = con.execute(
+            "SELECT ts, kind FROM events ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+        kinds = con.execute(
+            "SELECT kind, COUNT(*) FROM events GROUP BY kind"
+        ).fetchall()
+        print(f"  events in buffer: {n}")
+        for k, c in kinds:
+            print(f"    {k:12} {c}")
+        if latest:
+            age = time.time() - latest[0]
+            print(f"  last event: {latest[1]} ({age:.1f}s ago)")
+    n_frames = len(list(FRAME_DIR.glob("frame_*.png"))) if FRAME_DIR.exists() else 0
+    print(f"  frames on disk: {n_frames}")
+
+
+def cmd_info():
+    cmd_status()
+    print()
+    if not is_running():
+        return
+    r = asyncio.run(call_daemon("status"))
+    print(json.dumps(r, indent=2, default=str))
+
+
+def cmd_logs():
+    n = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+    if not DB_PATH.exists():
+        print("no events db")
+        return
+    con = sqlite3.connect(DB_PATH)
+    rows = con.execute(
+        "SELECT ts, kind, payload FROM events ORDER BY ts DESC LIMIT ?",
+        (n,),
+    ).fetchall()
+    for ts, kind, payload in reversed(rows):
+        when = time.strftime("%H:%M:%S", time.localtime(ts))
+        try:
+            p = json.loads(payload)
+        except Exception:
+            p = {}
+        if kind == "network":
+            line = (f"{p.get('phase','?'):8} {p.get('method',''):4} "
+                    f"{str(p.get('status','')):4} "
+                    f"{p.get('url','')[:80]}")
+        elif kind == "navigation":
+            line = f"{p.get('phase',''):10} {p.get('url','')[:80]}"
+        elif kind == "console":
+            t = str(p.get('text', p.get('args', '')))[:90]
+            line = f"[{p.get('level','?')}] {t}"
+        elif kind == "frame":
+            line = Path(p.get("path", "")).name
+        else:
+            line = json.dumps(p)[:90]
+        print(f"{when} {kind:11} {line}")
+
+
+def cmd_tail():
+    """Live-stream new events."""
+    if not DB_PATH.exists():
+        print("no events db")
+        return
+    last_ts = time.time()
+    print("[live] following events, ctrl-c to stop")
+    try:
+        while True:
+            con = sqlite3.connect(DB_PATH)
+            rows = con.execute(
+                "SELECT ts, kind, payload FROM events WHERE ts > ? "
+                "ORDER BY ts ASC", (last_ts,),
+            ).fetchall()
+            con.close()
+            for ts, kind, payload in rows:
+                last_ts = ts
+                when = time.strftime("%H:%M:%S", time.localtime(ts))
+                try:
+                    p = json.loads(payload)
+                except Exception:
+                    p = {}
+                summary = json.dumps(p)[:100]
+                print(f"{when} {kind:11} {summary}")
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_exec():
+    """browser-eyes exec OP key=value key=value"""
+    if len(sys.argv) < 3:
+        print("usage: browser-eyes exec OP [key=value ...]")
+        return
+    op = sys.argv[2]
+    args = {}
+    for pair in sys.argv[3:]:
+        if "=" not in pair:
+            print(f"bad arg: {pair} (expected key=value)")
+            return
+        k, v = pair.split("=", 1)
+        # try int/bool/json
+        if v.lower() == "true":
+            v = True
+        elif v.lower() == "false":
+            v = False
+        elif v.isdigit():
+            v = int(v)
+        elif v.startswith(("{", "[")):
+            try:
+                v = json.loads(v)
+            except Exception:
+                pass
+        args[k] = v
+    r = asyncio.run(call_daemon(op, **args))
+    print(json.dumps(r, indent=2, default=str))
+
+
+def cmd_ops():
+    """List ops by sending unknown op (daemon returns the list)."""
+    r = asyncio.run(call_daemon("__nonexistent__"))
+    ops = r.get("available", [])
+    if not ops:
+        # daemon not running, fall back to importing handlers
+        sys.path.insert(0, str(SRC_DIR))
+        try:
+            import handlers as h
+            ops = sorted(h.HANDLERS.keys())
+        except Exception as e:
+            print(f"daemon not running and can't import handlers: {e}")
+            return
+    for op in ops:
+        print(op)
+
+
+def cmd_mcp():
+    os.execvp(sys.executable, [sys.executable, str(MCP)])
+
+
+def cmd_wipe():
+    if is_running():
+        print("stop the daemon first: browser-eyes stop")
+        return
+    import shutil
+    if STATE_DIR.exists():
+        shutil.rmtree(STATE_DIR)
+        print(f"wiped {STATE_DIR}")
+    else:
+        print("nothing to wipe")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    cmds = {
+        "start": cmd_start,
+        "stop": cmd_stop,
+        "restart": cmd_restart,
+        "status": cmd_status,
+        "info": cmd_info,
+        "logs": cmd_logs,
+        "tail": cmd_tail,
+        "exec": cmd_exec,
+        "ops": cmd_ops,
+        "mcp": cmd_mcp,
+        "wipe": cmd_wipe,
+    }
+    op = sys.argv[1]
+    fn = cmds.get(op)
+    if not fn:
+        print(__doc__)
+        sys.exit(1)
+    fn()
+
+
+if __name__ == "__main__":
+    main()
